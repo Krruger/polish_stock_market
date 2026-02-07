@@ -5,144 +5,107 @@ const TradingChart = () => {
     const chartContainerRef = useRef();
     const chartInstanceRef = useRef(null);
     const candleSeriesRef = useRef(null);
-    const volumeSeriesRef = useRef(null);
-    const vwapSeriesRef = useRef(null);
-
-    // Funkcja licząca VWAP z resetem każdego dnia
-    const calculateDailyVWAP = (data) => {
-        let cumulativePV = 0;
-        let cumulativeVol = 0;
-        let lastDate = "";
-
-        return data.map(d => {
-            const currentDate = new Date(d.time * 1000).toISOString().split('T')[0];
-
-            // Jeśli zaczyna się nowy dzień, resetujemy liczniki VWAP
-            if (currentDate !== lastDate) {
-                cumulativePV = 0;
-                cumulativeVol = 0;
-                lastDate = currentDate;
-            }
-
-            cumulativePV += d.close * d.volume;
-            cumulativeVol += d.volume;
-
-            return {
-                time: d.time,
-                value: cumulativeVol !== 0 ? cumulativePV / cumulativeVol : d.close
-            };
-        });
-    };
 
     useEffect(() => {
         if (!chartContainerRef.current || chartInstanceRef.current) return;
 
-        // 1. Stworzenie wykresu
+        // 1. Obliczanie wymiarów pod 1080p bez żadnych odstępów
+        const fullWidth = window.innerWidth - 200;
+        const chartHeight = window.innerHeight - 150; // 50px na nagłówek
+
         const chart = LightweightCharts.createChart(chartContainerRef.current, {
-            width: chartContainerRef.current.clientWidth,
-            height: 600,
+            width: fullWidth,
+            height: chartHeight,
             layout: {
-                background: { type: LightweightCharts.ColorType.Solid, color: '#131722' },
+                background: { type: LightweightCharts.ColorType.Solid, color: '#0b0e14' },
                 textColor: '#d1d4dc',
+                fontSize: 14,
             },
             grid: {
-                vertLines: { color: '#2B2B43' },
-                horzLines: { color: '#2B2B43' },
+                vertLines: { color: '#161921' },
+                horzLines: { color: '#161921' },
             },
             timeScale: {
                 timeVisible: true,
-                secondsVisible: false,
-                borderColor: '#485c7b'
+                borderColor: '#2B2B43',
+                barSpacing: 12, // Większe świece = czytelniejszy Price Action
             },
-            // Konfiguracja osobnej skali dla wolumenu
-            leftPriceScale: {
-                visible: false,
+            rightPriceScale: {
+                borderColor: '#2B2B43',
+                alignLabels: true,
+            },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
             },
         });
 
-        // 2. Dodanie serii (Świece, VWAP, Wolumen)
         const candleSeries = chart.addCandlestickSeries({
-            upColor: '#26a69a', downColor: '#ef5350',
-            borderVisible: false, wickUpColor: '#26a69a', wickDownColor: '#ef5350',
-        });
-
-        const vwapSeries = chart.addLineSeries({
-            color: '#2962FF',
-            lineWidth: 2,
-            title: 'VWAP',
-            priceScaleId: 'right', // ta sama skala co cena
-        });
-
-        const volumeSeries = chart.addHistogramSeries({
-            priceFormat: { type: 'volume' },
-            priceScaleId: 'vol', // własna skala
-        });
-
-        // Pozycjonowanie wolumenu na dole (dolne 20% wykresu)
-        chart.priceScale('vol').applyOptions({
-            scaleMargins: {
-                top: 0.8,
-                bottom: 0,
-            },
+            upColor: '#26a69a',
+            downColor: '#ef5350',
+            borderVisible: false,
+            wickUpColor: '#26a69a',
+            wickDownColor: '#ef5350',
         });
 
         candleSeriesRef.current = candleSeries;
-        vwapSeriesRef.current = vwapSeries;
-        volumeSeriesRef.current = volumeSeries;
         chartInstanceRef.current = chart;
 
-        // 3. Pobieranie danych historycznych
+        // Funkcja do rysowania poziomów S/R (Swing Points)
+        const applySwingLevels = (levels) => {
+            candleSeries.createPriceLine({
+                price: levels.daily_high,
+                color: '#ef5350',
+                lineWidth: 2,
+                lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: 'RESISTANCE (HIGH)',
+            });
+
+            candleSeries.createPriceLine({
+                price: levels.daily_low,
+                color: '#26a69a',
+                lineWidth: 2,
+                lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: 'SUPPORT (LOW)',
+            });
+        };
+
+        // Pobieranie danych
         fetch('http://localhost:8000/api/v1/history')
             .then(res => res.json())
             .then(data => {
-                if (data && data.length > 0) {
-                    const sortedData = data.sort((a, b) => a.time - b.time);
-
-                    // Ustawienie świec
-                    candleSeries.setData(sortedData);
-
-                    // Ustawienie VWAP
-                    const vwapData = calculateDailyVWAP(sortedData);
-                    vwapSeries.setData(vwapData);
-
-                    // Ustawienie wolumenu
-                    const volumeData = sortedData.map(d => ({
-                        time: d.time,
-                        value: d.volume,
-                        color: d.close >= d.open ? 'rgba(38, 166, 154, 0.5)' : 'rgba(239, 83, 80, 0.5)'
-                    }));
-                    volumeSeries.setData(volumeData);
-
+                if (data.history && data.history.length > 0) {
+                    candleSeries.setData(data.history.sort((a, b) => a.time - b.time));
+                    if (data.levels) applySwingLevels(data.levels);
                     chart.timeScale().fitContent();
                 }
             })
-            .catch(err => console.error("API Error:", err));
+            .catch(err => console.error("History Error:", err));
 
-        // 4. WebSocket (Live Update)
-        const socket = new WebSocket('http://localhost:8000/ws');
-        socket.onmessage = (event) => {
-            const message = JSON.parse(event.data);
-            if (message.type === 'UPDATE' && candleSeriesRef.current) {
-                const candle = message.candle;
+        // WebSocket
+        const socket = new WebSocket('ws://localhost:8000/ws');
+        socket.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'UPDATE' && candleSeriesRef.current) {
+                candleSeriesRef.current.update(msg.candle);
+            }
+        };
 
-                // Aktualizujemy wszystko na raz
-                candleSeriesRef.current.update(candle);
-
-                volumeSeriesRef.current.update({
-                    time: candle.time,
-                    value: candle.volume,
-                    color: candle.close >= candle.open ? 'rgba(38, 166, 154, 0.5)' : 'rgba(239, 83, 80, 0.5)'
-                });
-
-                // VWAP live (uproszczony - bierze cenę zamknięcia)
-                vwapSeriesRef.current.update({
-                    time: candle.time,
-                    value: candle.close
+        // Automatyczne dopasowanie przy zmianie rozmiaru okna
+        const handleResize = () => {
+            if (chartInstanceRef.current) {
+                chartInstanceRef.current.applyOptions({
+                    width: window.innerWidth,
+                    height: window.innerHeight - 50
                 });
             }
         };
 
+        window.addEventListener('resize', handleResize);
+
         return () => {
+            window.removeEventListener('resize', handleResize);
             chart.remove();
             chartInstanceRef.current = null;
             socket.close();
@@ -150,20 +113,35 @@ const TradingChart = () => {
     }, []);
 
     return (
-        <div style={{ position: 'relative', width: '100%', padding: '10px' }}>
-            <div ref={chartContainerRef} style={{ width: '100%', height: '600px' }} />
+        <div style={{
+            width: '100vw',
+            height: '100vh',
+            display: 'flex',
+            flexDirection: 'column',
+            margin: 0,
+            padding: 0,
+            overflow: 'hidden'
+        }}>
+            {/* Header wypełniający 100% szerokości */}
             <div style={{
-                position: 'absolute', top: '25px', left: '25px', zIndex: 10,
-                color: 'white', fontFamily: 'sans-serif', background: 'rgba(0,0,0,0.4)',
-                padding: '10px', borderRadius: '4px', pointerEvents: 'none'
+                height: '50px',
+                width: '90%',
+                backgroundColor: '#131722',
+                display: 'flex',
+                alignItems: 'center',
+                padding: '0 20px',
+                boxSizing: 'border-box',
+                borderBottom: '1px solid #2B2B43',
+                justifyContent: 'space-between'
             }}>
-                <div style={{ fontSize: '16px', fontWeight: 'bold' }}>WIG20 INDEX</div>
-                <div style={{ fontSize: '12px', marginTop: '4px', display: 'flex', gap: '10px' }}>
-                    <span><span style={{color: '#26a69a'}}>●</span> Price</span>
-                    <span><span style={{color: '#2962FF'}}>●</span> VWAP</span>
-                    <span><span style={{color: 'rgba(239, 83, 80, 0.8)'}}>●</span> Vol</span>
+                <div style={{ color: '#fff', fontWeight: 'bold' }}>
+                    FW20 / WIG20 <span style={{ color: '#848e9c', fontWeight: 'normal', marginLeft: '10px' }}>| 1080p Full-Width View</span>
                 </div>
+                <div style={{ color: '#26a69a', fontSize: '13px' }}>● SYSTEM LIVE</div>
             </div>
+
+            {/* Wykres bez marginesów bocznych */}
+            <div ref={chartContainerRef} style={{ width: '90%', flex: 1 }} />
         </div>
     );
 };

@@ -1,73 +1,95 @@
 import asyncio
 import yfinance as yf
+import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
-from typing import List
-
-app = FastAPI()
-
-# Dodajemy CORS, żeby React mógł się połączyć
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- PRZECHOWYWANIE DANYCH W PAMIĘCI ---
-# Przechowujemy ostatnie pobrane świece, żeby nowi użytkownicy od razu widzieli wykres
-state = {
-    "history": [],
-    "last_timestamp": 0
-}
+from contextlib import asynccontextmanager
 
 
-# --- LOGIKA POBIERANIA DANYCH ---
-def fetch_wig20_data():
-    """Pobiera dane 1-minutowe dla WIG20 z Yahoo Finance"""
+# --- LOGIKA S/R ---
+def identify_levels(df):
+    """Wyznacza kluczowe poziomy dla Swing Tradera"""
+    levels = {
+        "daily_high": float(df['High'].max()),
+        "daily_low": float(df['Low'].min()),
+        "prev_day_close": float(df['Close'].iloc[0]),  # Przybliżenie dla historycznego Close
+    }
+
+    # Szukamy lokalnych szczytów (Fractals) jako bazy pod S/R
+    # Jeśli High świecy jest wyższy niż 2 świece przed i po - to jest to opór
+    pivots = []
+    for i in range(2, len(df) - 2):
+        if df['High'].iloc[i] > df['High'].iloc[i - 1] and df['High'].iloc[i] > df['High'].iloc[i + 1]:
+            pivots.append({"time": int(df.index[i].timestamp()), "price": float(df['High'].iloc[i]), "type": "RES"})
+        if df['Low'].iloc[i] < df['Low'].iloc[i - 1] and df['Low'].iloc[i] < df['Low'].iloc[i + 1]:
+            pivots.append({"time": int(df.index[i].timestamp()), "price": float(df['Low'].iloc[i]), "type": "SUP"})
+
+    return levels, pivots
+
+
+def get_market_data():
     try:
         ticker = yf.Ticker("WIG20.WA")
-        # Pobieramy ostatni 1 dzień z interwałem 1m
-        df = ticker.history(period="5d", interval="1m")
-        if df.empty:
-            return None
+        df = ticker.history(period="5d", interval="5m")  # Swing lepiej widać na 5m
+        if df.empty: return None
 
-        df = df.reset_index()
-        print(df)
-        # Konwersja do formatu akceptowanego przez Lightweight Charts
-        formatted_data = []
-        for _, row in df.iterrows():
-            formatted_data.append({
-                "time": int(row['Datetime'].timestamp()),
+        levels, pivots = identify_levels(df)
+
+        formatted = []
+        for index, row in df.iterrows():
+            formatted.append({
+                "time": int(index.timestamp()),
                 "open": float(row['Open']),
                 "high": float(row['High']),
                 "low": float(row['Low']),
                 "close": float(row['Close']),
-                "volume": int(row['Volume'])
             })
-        return formatted_data
+        return {"history": formatted, "levels": levels, "pivots": pivots}
     except Exception as e:
-        print(f"Błąd pobierania danych: {e}")
+        print(f"Błąd: {e}")
         return None
 
 
-# --- MANAGER WEBSOCKET ---
+# --- FASTAPI ---
+state = {"history": [], "levels": {}, "pivots": []}
+
+
+async def data_poller():
+    while True:
+        data = get_market_data()
+        if data:
+            state["history"] = data["history"]
+            state["levels"] = data["levels"]
+            state["pivots"] = data["pivots"]
+            await manager.broadcast({"type": "UPDATE", "candle": data["history"][-1], "levels": data["levels"]})
+        await asyncio.sleep(60)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(data_poller())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    async def connect(self, ws: WebSocket):
+        await ws.accept(); self.active_connections.append(ws)
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, ws: WebSocket):
+        self.active_connections.remove(ws)
 
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+    async def broadcast(self, msg: dict):
+        for conn in self.active_connections:
             try:
-                await connection.send_json(message)
+                await conn.send_json(msg)
             except:
                 pass
 
@@ -75,60 +97,15 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# --- POLLER (ZADANIE W TLE) ---
-async def data_poller():
-    """Pętla co 60 sekund sprawdza nowe dane i wysyła je przez WebSocket"""
-    print("Uruchomiono poller danych...")
-    while True:
-        new_data = fetch_wig20_data()
-
-        if new_data:
-            state["history"] = new_data
-            latest_candle = new_data[-1]
-
-            # Jeśli mamy nową świecę (inny timestamp niż ostatnio)
-            if latest_candle["time"] > state["last_timestamp"]:
-                state["last_timestamp"] = latest_candle["time"]
-                print(
-                    f"Nowa świeca: {datetime.fromtimestamp(state['last_timestamp'])} | Close: {latest_candle['close']}")
-
-                # Rozsyłamy informację do wszystkich połączonych traderów
-                await manager.broadcast({
-                    "type": "UPDATE",
-                    "candle": latest_candle
-                })
-
-        # Czekamy 60 sekund (Yahoo Finance odświeża dane z opóźnieniem 15 min,
-        # ale co minutę pojawia się nowa "opóźniona" świeca)
-        await asyncio.sleep(60)
-
-
-# --- START POLLERA PRZY URUCHOMIENIU SERWERA ---
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(data_poller())
-
-
-# --- ENDPOINTY API ---
-
 @app.get("/api/v1/history")
-async def get_history():
-    """Zwraca całą historię sesji (używane przy ładowaniu strony)"""
-    if not state["history"]:
-        data = fetch_wig20_data()
-        if data:
-            state["history"] = data
-    return state["history"]
+async def get_history(): return state
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Kanał dla danych w czasie rzeczywistym"""
     await manager.connect(websocket)
     try:
-        while True:
-            # Utrzymujemy połączenie (heartbeat)
-            await websocket.receive_text()
+        while True: await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
@@ -136,4 +113,4 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
