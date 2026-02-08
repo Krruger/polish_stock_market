@@ -1,61 +1,172 @@
+import asyncio
 import yfinance as yf
 import pandas as pd
+import numpy as np  # Potrzebne do obliczeń
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
 
-def get_intraday_wig20(interval='1m', period='1d'):
-    """
-    Pobiera dane intraday dla WIG20.
-    interval: '1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h'
-    period: '1d' (dzisiaj), '5d' (ostatnie 5 dni)
-    """
-    print(f"Pobieram dane intraday ({interval}) dla WIG20...")
+# --- NOWA LOGIKA: WYKRYWANIE FORMACJI ---
+def detect_patterns(df, levels):
+    """Analizuje świece i tworzy markery dla wykresu"""
+    markers = []
+    tolerance = 5.0  # Tolerancja w punktach (dla WIG20 ok. 5 pkt to dobra strefa)
 
+    for index, row in df.iterrows():
+        time_unix = int(index.timestamp())
+
+        # Obliczenia geometrii świecy
+        body_size = abs(row['Close'] - row['Open'])
+        full_range = row['High'] - row['Low']
+        upper_wick = row['High'] - max(row['Open'], row['Close'])
+        lower_wick = min(row['Open'], row['Close']) - row['Low']
+
+        # Zabezpieczenie przed dzieleniem przez zero (płaskie świece)
+        if full_range == 0: continue
+
+        # --- 1. PIN BARY PRZY POZIOMACH ---
+        # Bearish Pin Bar (Spadkowy) przy Opórze (Daily High)
+        if (row['High'] >= levels['daily_high'] - tolerance) and \
+                (upper_wick > 2 * body_size) and (upper_wick > 0.5 * full_range):
+            markers.append({
+                "time": time_unix, "position": "aboveBar", "color": "#ef5350",
+                "shape": "arrowDown", "text": "Pin Bar (Res)"
+            })
+
+        # Bullish Pin Bar (Wzrostowy) przy Wsparciu (Daily Low)
+        elif (row['Low'] <= levels['daily_low'] + tolerance) and \
+                (lower_wick > 2 * body_size) and (lower_wick > 0.5 * full_range):
+            markers.append({
+                "time": time_unix, "position": "belowBar", "color": "#26a69a",
+                "shape": "arrowUp", "text": "Pin Bar (Sup)"
+            })
+
+        # --- 2. FBO (FAKE BREAKOUTS) ---
+        # Fake Breakout Górą (Wybicie High i powrót)
+        elif (row['High'] > levels['daily_high']) and (row['Close'] < levels['daily_high']):
+            markers.append({
+                "time": time_unix, "position": "aboveBar", "color": "#FF9800",
+                "shape": "arrowDown", "text": "FBO?"
+            })
+
+        # Fake Breakout Dołem (Wybicie Low i powrót)
+        elif (row['Low'] < levels['daily_low']) and (row['Close'] > levels['daily_low']):
+            markers.append({
+                "time": time_unix, "position": "belowBar", "color": "#FF9800",
+                "shape": "arrowUp", "text": "FBO?"
+            })
+
+    return markers
+
+
+# --- LOGIKA DANYCH RYNKOWYCH ---
+def identify_levels(df):
+    """Wyznacza kluczowe poziomy sesyjne"""
+    return {
+        # Używamy max/min z całej pobranej historii (5 dni) jako przybliżenie ważnych stref
+        "daily_high": float(df['High'].max()),
+        "daily_low": float(df['Low'].min()),
+        # W wersji PRO liczylibyśmy to tylko dla bieżącego dnia
+    }
+
+
+def get_market_data():
     try:
-        # Pobieramy dane dla indeksu WIG20
-        # Yahoo Finance ma 15 min opóźnienia dla GPW
         ticker = yf.Ticker("WIG20.WA")
+        # Pobieramy 5 dni, interwał 5m jest lepszy do swingów i czystszych formacji
+        df = ticker.history(period="30d", interval="1h")
+        if df.empty: return None
 
-        # Pobranie historii intraday
-        df = ticker.history(period=period, interval=interval)
+        levels = identify_levels(df)
+        # TUTAJ wywołujemy nową funkcję:
+        markers = detect_patterns(df, levels)
 
-        if df.empty:
-            print("Brak danych. Sprawdź czy sesja GPW trwa lub czy symbol jest poprawny.")
-            return None
-
-        # Czyszczenie i formatowanie
-        df = df.reset_index()
-        # Zmiana nazwy kolumny czasu na 'time' dla kompatybilności z wykresami
-        df.rename(columns={
-            'Datetime': 'time',
-            'Open': 'open',
-            'High': 'high',
-            'Low': 'low',
-            'Close': 'close',
-            'Volume': 'volume'
-        }, inplace=True)
-
-        # Konwersja czasu na format Unix Timestamp (sekundy) - tego wymaga Lightweight Charts
-        df['time'] = df['time'].apply(lambda x: int(x.timestamp()))
-
-        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
-
+        formatted_history = []
+        for index, row in df.iterrows():
+            formatted_history.append({
+                "time": int(index.timestamp()),
+                "open": float(row['Open']),
+                "high": float(row['High']),
+                "low": float(row['Low']),
+                "close": float(row['Close']),
+            })
+        # Zwracamy historię, poziomy ORAZ markery
+        return {"history": formatted_history, "levels": levels, "markers": markers}
     except Exception as e:
-        print(f"Błąd yfinance: {e}")
+        print(f"Błąd: {e}")
         return None
 
 
-# --- PRZYGOTOWANIE DANYCH DLA FRONTENDU ---
-def get_chart_json():
-    df = get_intraday_wig20(interval='1m', period='5d')
-    if df is not None:
-        # Zwracamy listę słowników (format JSON)
-        return df.to_dict(orient='records')
-    return []
+# --- FASTAPI SETUP ---
+# Stan globalny przechowuje teraz też markery
+state = {"history": [], "levels": {}, "markers": []}
 
 
-# Test
+async def data_poller():
+    while True:
+        data = get_market_data()
+        if data:
+            state["history"] = data["history"]
+            state["levels"] = data["levels"]
+            state["markers"] = data["markers"]  # Zapisujemy markery
+
+            # W WebSockecie wysyłamy tylko ostatnią świecę, poziomy nie zmieniają się co minutę
+            await manager.broadcast({
+                "type": "UPDATE",
+                "candle": data["history"][-1]
+            })
+        # Yahoo ma 15m opóźnienia, odświeżanie co 5 minut wystarczy dla interwału 5m
+        await asyncio.sleep(300)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(data_poller())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept(); self.active_connections.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self.active_connections.remove(ws)
+
+    async def broadcast(self, msg: dict):
+        for conn in self.active_connections:
+            try:
+                await conn.send_json(msg)
+            except:
+                pass
+
+
+manager = ConnectionManager()
+
+
+@app.get("/api/v1/history")
+async def get_history():
+    # Zwracamy pełny stan przy pierwszym załadowaniu
+    return state
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True: await websocket.receive_text()
+    except WebSocketDisconnect: manager.disconnect(websocket)
+
+
 if __name__ == "__main__":
-    data = get_chart_json()
-    if data:
-        print(f"Pobrano {len(data)} świec intraday.")
-        print(f"Ostatnia świeca: {data[-1]}")
+    import uvicorn
+
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
