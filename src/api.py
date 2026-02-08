@@ -1,12 +1,19 @@
 import asyncio
+import os
+
 import yfinance as yf
 import pandas as pd
 import math
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+load_dotenv()
 
-
+TOLERANCE = float(os.getenv("S_R_TOLERANCE", 10.0))
+TAIL_SIZE = int(os.getenv("S_R_TAIL_SIZE", 500))
+PERIOD_M15 = os.getenv("PERIOD_M15", "30d")
+PERIOD_H1 = os.getenv("PERIOD_H1", "60d")
 def get_trend_bias(df_h1, levels_h1, markers_h1):
     """Analizuje H1 i zwraca kierunek dominujący."""
     try:
@@ -50,7 +57,7 @@ def find_enhanced_sr_levels(df):
     """Szuka szczytów i dołków, a następnie grupuje je w strefy."""
     raw_pivots = []
     # Analizujemy ostatnie 500 świec
-    data = df.tail(9999999)
+    data = df.tail(TAIL_SIZE)
     for i in range(2, len(data) - 2):
         # Szczyt (Pivot High)
         if data['High'].iloc[i] == data['High'].iloc[i - 2:i + 3].max():
@@ -62,7 +69,6 @@ def find_enhanced_sr_levels(df):
     if not raw_pivots: return []
     raw_pivots.sort()
 
-    TOLERANCE = 25.0
     merged_levels = []
     g = [raw_pivots[0]]
 
@@ -125,8 +131,8 @@ def calculate_adr_status(df):
 def get_market_data():
     try:
         ticker = yf.Ticker("WIG20.WA")
-        df_15m = ticker.history(period="30d", interval="15m")
-        df_1h = ticker.history(period="90d", interval="1h")
+        df_15m = ticker.history(period=PERIOD_M15, interval="15m")
+        df_1h = ticker.history(period=PERIOD_H1, interval="1h")
 
         if df_15m.empty or df_1h.empty: return None
 
