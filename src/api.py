@@ -8,6 +8,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
+from indicators.indicators import detect_structure, detect_filtered_structure
+
 load_dotenv()
 
 TOLERANCE = float(os.getenv("S_R_TOLERANCE", 10.0))
@@ -114,24 +117,47 @@ def detect_breakouts(df, levels_list):
 
 def calculate_adr_status(df):
     try:
-        d = df.copy();
+        if df is None or df.empty: return {"adr": 0.0, "today_range": 0.0, "usage": 0.0, "h_limit": 0, "l_limit": 0}
+
+        d = df.copy()
         d['d'] = d.index.date
-        daily = d.groupby('d').agg({'High': 'max', 'Low': 'min'})
+        daily = d.groupby('d').agg({'High': 'max', 'Low': 'min', 'Close': 'last'})
         daily['r'] = daily['High'] - daily['Low']
-        if len(daily) < 2: return {"adr": 0.0, "today_range": 0.0, "usage": 0.0}
+
+        if len(daily) < 2: return {"adr": 0.0, "today_range": 0.0, "usage": 0.0, "h_limit": 0, "l_limit": 0}
+
+        # Średni zasięg z 14 dni
         adr_val = to_f(daily['r'].iloc[:-1].tail(14).mean())
-        t_range = to_f(daily['High'].iloc[-1] - daily['Low'].iloc[-1])
+
+        # Cena zamknięcia z poprzedniej sesji (punkt bazowy dla linii)
+        prev_close = to_f(daily['Close'].iloc[-2])
+
+        # Dzisiejszy zasięg
+        t_high = to_f(daily['High'].iloc[-1])
+        t_low = to_f(daily['Low'].iloc[-1])
+        t_range = t_high - t_low
         usage = (t_range / adr_val * 100) if adr_val > 0 else 0.0
-        return {"adr": round(adr_val, 1), "today_range": round(t_range, 1), "usage": round(to_f(usage), 1)}
-    except:
-        return {"adr": 0.0, "today_range": 0.0, "usage": 0.0}
+
+        # Wyliczamy linie ADR od ceny zamknięcia
+        # Formula: $Limit = Close_{prev} \pm ADR$
+        return {
+            "adr": round(adr_val, 1),
+            "today_range": round(t_range, 1),
+            "usage": round(to_f(usage), 1),
+            "h_limit": round(prev_close + adr_val, 1),
+            "l_limit": round(prev_close - adr_val, 1)
+        }
+    except Exception as e:
+        print(f"ADR Error: {e}")
+        return {"adr": 0.0, "today_range": 0.0, "usage": 0.0, "h_limit": 0, "l_limit": 0}
 
 
 # --- 4. GŁÓWNY SILNIK DANYCH ---
 def get_market_data():
     try:
         ticker = yf.Ticker("WIG20.WA")
-        df_15m = ticker.history(period=PERIOD_M15, interval="15m")
+        # Poprawione interwały
+        df_15m = ticker.history(period=PERIOD_M15, interval="5m")
         df_1h = ticker.history(period=PERIOD_H1, interval="1h")
 
         if df_15m.empty or df_1h.empty: return None
@@ -139,32 +165,46 @@ def get_market_data():
         if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.get_level_values(0)
         if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
 
-        # LOGIKA M15
+        # --- LOGIKA M15 ---
         lvls_15m = find_enhanced_sr_levels(df_15m)
-        markers_15m = detect_breakouts(df_15m, lvls_15m)
-
-        # LOGIKA H1 (Dodajemy markery!)
         lvls_1h = find_enhanced_sr_levels(df_1h)
-        markers_1h = detect_breakouts(df_1h, lvls_1h)
-        bias = get_trend_bias(df_1h, lvls_1h, markers_1h)
+
+        # 2. Wykrywamy przefiltrowaną strukturę (tylko przy S/R)
+        structure_m15 = detect_filtered_structure(df_15m, lvls_15m, window=3)
+        structure_h1 = detect_filtered_structure(df_1h, lvls_1h, window=3)
+
+        # 3. Standardowe markery wybić (kropki)
+        sr_markers_15m = detect_breakouts(df_15m, lvls_15m)
+        sr_markers_h1 = detect_breakouts(df_1h, lvls_1h)
+
+        # 4. Łączymy wszystko
+        all_markers_15m = sr_markers_15m + structure_m15
+        all_markers_15m.sort(key=lambda x: x['time'])
+
+        all_markers_1h = sr_markers_h1 + structure_h1
+        all_markers_1h.sort(key=lambda x: x['time'])
+
+        # Trend Bias obliczamy na podstawie pełnej listy sygnałów
+        bias = get_trend_bias(df_1h, lvls_1h, all_markers_1h)
+
         return {
             "m15": {
                 "history": [{"time": int(i.timestamp()), "open": to_f(r['Open']), "high": to_f(r['High']),
                              "low": to_f(r['Low']), "close": to_f(r['Close'])} for i, r in df_15m.iterrows()],
                 "levels": lvls_15m,
-                "markers": markers_15m,
+                "markers": all_markers_15m,  # <--- POPRAWKA: Wysyłamy połączoną listę
                 "adr": calculate_adr_status(df_15m)
             },
             "h1": {
                 "history": [{"time": int(i.timestamp()), "open": to_f(r['Open']), "high": to_f(r['High']),
                              "low": to_f(r['Low']), "close": to_f(r['Close'])} for i, r in df_1h.iterrows()],
                 "levels": lvls_1h,
-                "markers": markers_1h  # <--- NOWOŚĆ: Markery trendu H1
+                "markers": all_markers_1h  # <--- POPRAWKA: Tutaj też
             },
             "bias": bias
         }
     except Exception as e:
-        print(f"❌ Error: {e}");
+        print(f"❌ Error w get_market_data: {e}")
         return None
 
 
