@@ -9,12 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
-from indicators.indicators import detect_structure, detect_filtered_structure
+from indicators.indicators import detect_filtered_structure
 
 load_dotenv()
 
-TOLERANCE = float(os.getenv("S_R_TOLERANCE", 10.0))
-TAIL_SIZE = int(os.getenv("S_R_TAIL_SIZE", 500))
+TOLERANCE = float(os.getenv("S_R_TOLERANCE", 5.0))
+TAIL_SIZE = int(os.getenv("S_R_TAIL_SIZE", 9999999))
 PERIOD_M15 = os.getenv("PERIOD_M15", "30d")
 PERIOD_H1 = os.getenv("PERIOD_H1", "60d")
 def get_trend_bias(df_h1, levels_h1, markers_h1):
@@ -154,52 +154,72 @@ def calculate_adr_status(df):
 
 # --- 4. GŁÓWNY SILNIK DANYCH ---
 def get_market_data():
+    """
+    Główna funkcja pobierająca dane rynkowe, obliczająca wskaźniki i zwracająca strukturę dla frontend'u.
+    """
     try:
         ticker = yf.Ticker("WIG20.WA")
-        # Poprawione interwały
-        df_15m = ticker.history(period=PERIOD_M15, interval="5m")
+
+        # Pobieranie danych historycznych
+        # Używamy "15m" dla interwału M15 (spójność z nazwą zmiennej) i "1h" dla H1
+        df_15m = ticker.history(period=PERIOD_M15, interval="15m")
         df_1h = ticker.history(period=PERIOD_H1, interval="1h")
 
-        if df_15m.empty or df_1h.empty: return None
+        if df_15m.empty or df_1h.empty:
+            print("⚠️ Brak danych dla WIG20.WA")
+            return None
 
+        # Obsługa MultiIndex (częsty przypadek w nowszych wersjach yfinance)
         if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.get_level_values(0)
         if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
 
-        # --- LOGIKA M15 ---
+        # --- 1. Wykrywanie poziomów S/R (Support/Resistance) ---
+        # Funkcja zdefiniowana w api.py
         lvls_15m = find_enhanced_sr_levels(df_15m)
         lvls_1h = find_enhanced_sr_levels(df_1h)
 
-        # 2. Wykrywamy przefiltrowaną strukturę (tylko przy S/R)
+        # --- 2. Wykrywanie struktury filtrowanej przez S/R ---
+        # Funkcja importowana z src/indicators/indicators.py
         structure_m15 = detect_filtered_structure(df_15m, lvls_15m, window=3)
         structure_h1 = detect_filtered_structure(df_1h, lvls_1h, window=3)
 
-        # 3. Standardowe markery wybić (kropki)
+        # --- 3. Wykrywanie standardowych wybić (Breakouts) ---
+        # Funkcja zdefiniowana w api.py
         sr_markers_15m = detect_breakouts(df_15m, lvls_15m)
         sr_markers_h1 = detect_breakouts(df_1h, lvls_1h)
 
-        # 4. Łączymy wszystko
+        # --- 4. Łączenie i sortowanie markerów ---
+        # Łączymy markery wybić i struktury w jedną listę dla wykresu
         all_markers_15m = sr_markers_15m + structure_m15
         all_markers_15m.sort(key=lambda x: x['time'])
 
-        all_markers_1h = sr_markers_h1 + structure_h1
-        all_markers_1h.sort(key=lambda x: x['time'])
+        all_markers_h1 = sr_markers_h1 + structure_h1
+        all_markers_h1.sort(key=lambda x: x['time'])
 
-        # Trend Bias obliczamy na podstawie pełnej listy sygnałów
-        bias = get_trend_bias(df_1h, lvls_1h, all_markers_1h)
+        # --- 5. Obliczanie Trend Bias (Sentymentu) ---
+        # Analiza na podstawie interwału H1
+        bias = get_trend_bias(df_1h, lvls_1h, all_markers_h1)
 
+        # --- 6. Zwracanie gotowego obiektu danych ---
         return {
             "m15": {
-                "history": [{"time": int(i.timestamp()), "open": to_f(r['Open']), "high": to_f(r['High']),
-                             "low": to_f(r['Low']), "close": to_f(r['Close'])} for i, r in df_15m.iterrows()],
+                "history": [{"time": int(i.timestamp()),
+                             "open": to_f(r['Open']),
+                             "high": to_f(r['High']),
+                             "low": to_f(r['Low']),
+                             "close": to_f(r['Close'])} for i, r in df_15m.iterrows()],
                 "levels": lvls_15m,
-                "markers": all_markers_15m,  # <--- POPRAWKA: Wysyłamy połączoną listę
-                "adr": calculate_adr_status(df_15m)
+                "markers": all_markers_15m,
+                "adr": calculate_adr_status(df_15m)  # ADR obliczamy dla niższego interwału
             },
             "h1": {
-                "history": [{"time": int(i.timestamp()), "open": to_f(r['Open']), "high": to_f(r['High']),
-                             "low": to_f(r['Low']), "close": to_f(r['Close'])} for i, r in df_1h.iterrows()],
+                "history": [{"time": int(i.timestamp()),
+                             "open": to_f(r['Open']),
+                             "high": to_f(r['High']),
+                             "low": to_f(r['Low']),
+                             "close": to_f(r['Close'])} for i, r in df_1h.iterrows()],
                 "levels": lvls_1h,
-                "markers": all_markers_1h  # <--- POPRAWKA: Tutaj też
+                "markers": all_markers_h1
             },
             "bias": bias
         }
