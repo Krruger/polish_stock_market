@@ -15,8 +15,8 @@ load_dotenv()
 
 TOLERANCE = float(os.getenv("S_R_TOLERANCE", 5.0))
 TAIL_SIZE = int(os.getenv("S_R_TAIL_SIZE", 9999999))
-PERIOD_M15 = os.getenv("PERIOD_M15", "30d")
-PERIOD_H1 = os.getenv("PERIOD_H1", "60d")
+PERIOD_M1 = os.getenv("PERIOD_M15", "8d")
+PERIOD_M5 = os.getenv("PERIOD_H1", "8d")
 def get_trend_bias(df_h1, levels_h1, markers_h1):
     """Analizuje H1 i zwraca kierunek dominujący."""
     try:
@@ -162,8 +162,8 @@ def get_market_data():
 
         # Pobieranie danych historycznych
         # Używamy "15m" dla interwału M15 (spójność z nazwą zmiennej) i "1h" dla H1
-        df_15m = ticker.history(period=PERIOD_M15, interval="15m")
-        df_1h = ticker.history(period=PERIOD_H1, interval="1h")
+        df_15m = ticker.history(period=PERIOD_M15, interval="1m")
+        df_1h = ticker.history(period=PERIOD_H1, interval="5m")
 
         if df_15m.empty or df_1h.empty:
             print("⚠️ Brak danych dla WIG20.WA")
